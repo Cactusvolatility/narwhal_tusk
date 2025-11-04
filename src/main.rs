@@ -1,7 +1,7 @@
 use narwhal_tusk::{consensus::{self, ConsensusEnv}, types::*};
 
 fn main() {
-    println!("test Sync simulation");
+    println!("run test");
 
     let validators = vec![
         ValidatorInfo { id: 1, stake: 100},
