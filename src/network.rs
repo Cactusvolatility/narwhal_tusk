@@ -1,9 +1,11 @@
 
-use std::{collections::HashMap, thread::sleep, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use futures::channel::mpsc;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::sleep;
 
 use crate::{Block, Hash, ValidatorId, Certificate};
+use rand::Rng;
 
 #[derive(Clone, Debug)]
 pub struct NetworkMsg {
@@ -39,61 +41,82 @@ impl  Default for SimulationConfig {
     }
 }
 
-pub struct Simulator {
+struct NetInner {
     config: SimulationConfig,
-    node_channels: HashMap<ValidatorId, mpsc::UnboundedSender<NetworkMsg>>,
-    message_counts: HashMap<ValidatorId, usize>,
+    // TODO:routes will change over time
+    routes: RwLock<HashMap<ValidatorId, mpsc::UnboundedSender<NetworkMsg>>>
+}
+
+impl NetInner {
+    fn new(config: SimulationConfig) -> Self {
+        Self {
+            config,
+            routes: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+pub struct Simulator {
+    inner: Arc<NetInner>,
+}
+
+pub struct NetworkHandle {
+    inner:Arc<NetInner>,
 }
 
 impl Simulator {
     pub fn new(config: SimulationConfig) -> Self {
-        Self {
-            config,
-            node_channels: HashMap::new(),
-            message_counts: HashMap::new(),
-        }
+        Self { inner: Arc::new(NetInner::new(config)) }
     }
 
-    // set up channel
-    pub fn register_node(&mut self, node_id: ValidatorId) -> mpsc::UnboundedReceiver<NetworkMsg> {
+    // create a handle at the start
+    pub fn handle(&self) -> NetworkHandle {
+        NetworkHandle {inner: Arc::clone(&self.inner)}
+    }
+
+    pub async fn register_node(&self, id: ValidatorId) -> mpsc::UnboundedReceiver<NetworkMsg> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.node_channels.insert(node_id, tx);
-        self.message_counts.insert(node_id, 0);
-        return rx
+        self.inner.routes.write().await.insert(id,tx);
+        rx
     }
+}
 
-    // broadcast
-    pub async fn broadcast_msg(&mut self, message: NetworkMsg) {
-        // make sure it's not from ourselves
-        let target_nodes: Vec<ValidatorId> = self.node_channels.keys().copied()
-            .filter(|&id| id != message.from)
-            .collect();
-
-        for target in target_nodes {
-            let mut msg = message.clone();
-            msg.to = target;
-            self.send_message(msg).await;
+impl NetworkHandle {
+    pub async fn send(&self, mut msg: NetworkMsg) {
+        // packet loss
+        let loss = self.inner.config.packet_loss_rate.clamp(0.0, 1.0);
+        if rand::random::<f64>() < loss {
+            return
         }
 
-    }
+        let (low, high) = self.inner.config.latency_ms;
+        let latency = rand::rng().random_range(low..high);
 
-    pub async fn send_message(&mut self, message: NetworkMsg) {
-        if rand::thread_rng().gen_bool(self.config.packet_loss_rate.clamp(0.0, 1.0)) 
-        {
-            return;
-        }
-        
-        let (min_latency, max_latency) = self.config.latency_ms;
-        let latency = rand::thread_rng().gen_range(min_latency,max_latency);
+        // Option<Sender>
+        let tx_opt = {
+            let routes = self.inner.routes.read().await;
+            routes.get(&msg.to).cloned()
+        };
 
-        if let Some(tx) = self.node_channels.get(&message.to) {
-            let tx = tx.clone();
+        // delay with latency
+        if let Some(tx) = tx_opt {
             tokio::spawn(async move {
                 sleep(Duration::from_millis(latency)).await;
-                let _ = tx.send(message);
+                let _ = tx.send(msg);
             });
         }
-    
     }
 
+    pub async fn broadcast(&self, from: ValidatorId, payload: MessagePayload) {
+        let targets: Vec<ValidatorId> = {
+            let routes = self.inner.routes.read().await;
+            routes.keys().copied().filter(|&id| id != from).collect()
+        };
+
+        // send messages to the targets in my routes
+        for to in targets {
+            let msg = NetworkMsg { from, to, payload: payload.clone()};
+            self.send(msg).await;
+        }
+    }
 }

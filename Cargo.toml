@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 sha2 = "0.10"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 rand = "0.9"
-futures = {version =  "0.3", features = ["channel-unbounded"]}
-tokio-util = "0.7"
+futures = {version =  "0.3"}
+tokio-util = "0.7.16"

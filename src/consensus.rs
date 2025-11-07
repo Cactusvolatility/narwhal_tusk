@@ -3,26 +3,31 @@
 #![allow(unused_imports)] 
 
 use std::{collections::{HashMap, HashSet}, path::Ancestors, vec};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
-use crate::{types, Block, Certificate, Hash, ValidatorId, ValidatorSet, Transaction};
+use crate::{Block, Certificate, Hash, Transaction, ValidatorId, ValidatorSet, dag, types};
 use crate::{dag::DAG};
 
-pub struct ConsensusEnv {
+#[derive(Default)]
+pub struct ConsensusState {
     pub dag: DAG,
-    pub validator_set: ValidatorSet,
     pub current_round: u32,
     pub committed_blocks: HashSet<Hash>,
     pub certificates: HashMap<Hash, Certificate>,
 }
 
-impl ConsensusEnv {
+#[derive(Clone)]
+pub struct ConsensusHandle {
+    state: Arc<RwLock<ConsensusState>>,
+    validator_set: Arc<ValidatorSet>,
+}
+
+impl ConsensusHandle {
     pub fn new(validator_set: ValidatorSet) -> Self {
         Self {
-            dag: DAG::default(),
-            validator_set,
-            current_round: 0,
-            committed_blocks: HashSet::new(),
-            certificates:HashMap::new(),
+            state: Arc::new(RwLock::new(ConsensusState::default())),
+            validator_set: Arc::new(validator_set),
         }
     }
     /* Narwhal Methods:
@@ -32,46 +37,75 @@ impl ConsensusEnv {
      */
 
     // Author is broadcasting block to other nodes
-    pub fn propose_block(&mut self, txs: Vec<Transaction>, author: ValidatorId) -> Result<Block, String> {
+    pub async fn propose_block(&mut self, txs: Vec<Transaction>, author: ValidatorId) -> Result<Block, String> {
         // annotate parents so that .collect() will give me a Vec
-        let parents: Vec<Hash> = self.dag.get_frontier().iter().copied().collect();
+        
+        let env = self.state.read().await;
+        let parents: Vec<Hash> = env.dag.get_frontier().iter().copied().collect();
+
+        // do I want to maintain my block
 
         // new block
-        let block = Block::new(txs, parents, author, self.current_round);
+        let block = Block::new(txs, parents, author, env.current_round);
+        drop(env);
+        
         // ?.. I guess I haven't voted yet
-        self.dag.insert_block(block.clone())?;
+        {
+            let mut env = self.state.write().await;
+            env.dag.insert_block(block.clone())?;
+        }
 
         Ok(block)        
     }
 
     // Vote on if block is fine
-    pub fn vote_block(&mut self, block_hash: &Hash, voter: ValidatorId) -> Result<(), String> {
+    pub async fn vote_block(&mut self, block_hash: &Hash, voter: ValidatorId) -> Result<(), String> {
         // check if valid block
-        if !self.dag.contains_block(block_hash) {
-            return Err("Not a valid block - not in dag".to_string());
-        }
+        {
+            let env = self.state.read().await;
+            if !env.dag.contains_block(block_hash) {
+                return Err("Not a valid block - not in dag".to_string());
+            }
 
-        // check if valid voter
-        if !self.validator_set.validators.contains_key(&voter){
-            return Err("Not a valid voter - not in validator set".to_string());
+            // check if valid voter
+            if !self.validator_set.validators.contains_key(&voter){
+                return Err("Not a valid voter - not in validator set".to_string());
+            }
         }
+        // drop lock
 
         // create cert if does not exist so we can vote on it
-        if !self.certificates.contains_key(block_hash) {
-            let cert = Certificate::new(*block_hash, self.current_round);
-            self.certificates.insert(*block_hash, cert);
-        }
+        {
+            let mut env = self.state.write().await;
 
-        // add the signature to the cert
-        let signature = [voter as u8; 64];
-        if let Some(cert) = self.certificates.get_mut(block_hash) {
-            cert.add_signature(voter, signature);
+            let round = env.current_round;
+            let cert = env
+                .certificates
+                .entry(*block_hash)
+                .or_insert_with(|| Certificate::new(*block_hash, round));
+
+            let sig = [voter as u8; 64];
+            cert.add_signature(voter, sig);
+
         }
+        // drop lock
 
         Ok(())
     }
 
-    pub fn get_round_blocks(&self, round:u32) -> Vec<Hash> {
+    pub async fn accept_block(&mut self, block: Block) -> Result<(), String> {
+        let mut env = self.state.write().await;
+        if !self.validator_set.validators.contains_key(&block.author) {
+            return Err("Block author not in set".to_string());
+        }
+
+        env.dag.insert_block(block)?;
+        Ok(())
+    }
+
+    // inefficient wih RwLock - just directly read it
+    /*
+    pub async fn get_round_blocks(&self, round:u32) -> Vec<Hash> {
         let mut result = Vec::new();
 
         for (hash,cert) in self.certificates.iter() {
@@ -83,6 +117,7 @@ impl ConsensusEnv {
 
         result
     }
+    */
 
     /*  Tusk Methods:
         choose a leader = pick validator
@@ -91,15 +126,16 @@ impl ConsensusEnv {
      */
 
     #[allow(clippy::collapsible_if)]
-    pub fn get_leader(&self, round:u32) -> Option<Hash> {
+    pub async fn get_leader(&self, round:u32) -> Option<Hash> {
         println!("run get leader");
         let leader = choose_leader(round, self.validator_set.validators.len() as u32);
 
         // find the block that the leader proposed
-        if let Some(leader_hash) = self.dag.get_author_round_block(leader, round) {
+        let env = self.state.read().await;
+        if let Some(leader_hash) = env.dag.get_author_round_block(leader, round) {
             
             // if the leader has a cert
-            if let Some(leader_cert) = self.certificates.get(&leader_hash) {
+            if let Some(leader_cert) = env.certificates.get(&leader_hash) {
 
                 // if the leader cert is valid
                 if leader_cert.is_valid_cert(&self.validator_set) {
@@ -117,14 +153,35 @@ impl ConsensusEnv {
         // where are these blocks located?
         // they don't all have to be frontier
     #[allow(clippy::collapsible_if)]
-    pub fn commit_blocks(&mut self) ->Vec<Hash> {
+    pub async fn commit_blocks(&mut self) ->Vec<Hash> {
         let mut committed = Vec::new();
 
-        if self.current_round < 2 {
-            // shouldn't this be an error
-            return committed
+        let tusk_round = {
+            let env = self.state.read().await;
+            if env.current_round < 2 {
+                return committed;
+            }
+
+            // we reduce round to keep it around 3 
+            env.current_round - 2
+        };
+
+        if let Some(leader_block) = self.get_leader(tusk_round).await {
+            let mut env = self.state.write().await;
+
+            if env.committed_blocks.insert(leader_block) {
+                committed.push(leader_block);
+
+                // commit ancestors that have certs
+                for anc in env.dag.get_ancestors(&leader_block) {
+                    if env.certificates.contains_key(&anc) && env.committed_blocks.insert(anc) {
+                        committed.push(anc);
+                    }
+                }
+            }
         }
 
+        /*
         // if round greater than 2
         if self.current_round >= 2 {
             let tusk_round = self.current_round - 2;
@@ -156,14 +213,32 @@ impl ConsensusEnv {
                 }
             }
         }
+        */
 
         committed
+    }
+    // since each handle has its own state - can't keep the rounds in the simulation
+    pub async fn advance_round(&self) {
+        let mut env = self.state.write().await;
+        env.current_round += 1;
+    }
+
+    // separate check valid
+    pub async fn cert_is_valid(&self, hash: &Hash) -> bool {
+        let env = self.state.read().await;
+        if let Some(cert) = env.certificates.get(hash) {
+            return cert.is_valid_cert(&self.validator_set);
+        }
+
+        return false
     }
 }
 
 // what do I need here
     // round, DAG
 //pub fn committed_blocks()
+
+
 
 pub fn choose_leader(round:u32, validator_count: u32) -> u32 {
     // skip using shared coin
