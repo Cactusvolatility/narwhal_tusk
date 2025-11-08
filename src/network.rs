@@ -56,10 +56,12 @@ impl NetInner {
     }
 }
 
+#[derive(Clone)]
 pub struct Simulator {
     inner: Arc<NetInner>,
 }
 
+#[derive(Clone)]
 pub struct NetworkHandle {
     inner:Arc<NetInner>,
 }

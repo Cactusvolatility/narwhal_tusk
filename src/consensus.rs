@@ -127,7 +127,7 @@ impl ConsensusHandle {
 
     #[allow(clippy::collapsible_if)]
     pub async fn get_leader(&self, round:u32) -> Option<Hash> {
-        println!("run get leader");
+        //println!("run get leader");
         let leader = choose_leader(round, self.validator_set.validators.len() as u32);
 
         // find the block that the leader proposed
@@ -139,7 +139,7 @@ impl ConsensusHandle {
 
                 // if the leader cert is valid
                 if leader_cert.is_valid_cert(&self.validator_set) {
-                    println!("I have a leader");
+                    //println!("I have a leader");
                     return Some(leader_hash)
                 }
             }
@@ -217,6 +217,7 @@ impl ConsensusHandle {
 
         committed
     }
+
     // since each handle has its own state - can't keep the rounds in the simulation
     pub async fn advance_round(&self) {
         let mut env = self.state.write().await;
@@ -230,7 +231,7 @@ impl ConsensusHandle {
             return cert.is_valid_cert(&self.validator_set);
         }
 
-        return false
+        false
     }
 }
 
